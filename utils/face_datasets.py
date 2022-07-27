@@ -58,6 +58,25 @@ def exif_size(img):
 def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=False, cache=False, pad=0.0, rect=False,
                       rank=-1, world_size=1, workers=8, image_weights=False, quad=False, prefix=''):
     # Make sure only the first process in DDP process the dataset first, and the following others can use the cache
+    """在train.py中被调用，用于生成Trainloader, dataset，testloader
+    自定义dataloader函数: 调用LoadImagesAndLabels获取数据集(包括数据增强) + 调用分布式采样器DistributedSampler +
+                        自定义InfiniteDataLoader 进行永久持续的采样数据
+    :param path: 图片数据加载路径 train/test  如: ../datasets/VOC/images/train2007
+    :param imgsz: train/test图片尺寸（数据增强后大小） 640
+    :param batch_size: batch size 大小 8/16/32
+    :param stride: 模型最大stride=32   [32 16 8]
+    :param single_cls: 数据集是否是单类别 默认False
+    :param hyp: 超参列表dict 网络训练时的一些超参数，包括学习率等，这里主要用到里面一些关于数据增强(旋转、平移等)的系数
+    :param augment: 是否要进行数据增强  True
+    :param cache: 是否cache_images False
+    :param pad: 设置矩形训练的shape时进行的填充 默认0.0
+    :param rect: 是否开启矩形train/test  默认训练集关闭 验证集开启
+    :param rank:  多卡训练时的进程编号 rank为进程编号  -1且gpu=1时不进行分布式  -1且多块gpu使用DataParallel模式  默认-1
+    :param workers: dataloader的numworks 加载数据时的cpu进程数
+    :param image_weights: 训练时是否根据图片样本真实框分布权重来选择图片  默认False
+    :param quad: dataloader取数据时, 是否使用collate_fn4代替collate_fn  默认False
+    :param prefix: 显示信息   一个标志，多为train/val，处理标签时保存cache文件会用到
+    """
     with torch_distributed_zero_first(rank):
         dataset = LoadFaceImagesAndLabels(path, imgsz, batch_size,
                                       augment=augment,  # augment images
@@ -116,11 +135,27 @@ class _RepeatSampler(object):
 class LoadFaceImagesAndLabels(Dataset):  # for training/testing
     def __init__(self, path, img_size=640, batch_size=16, augment=False, hyp=None, rect=False, image_weights=False,
                  cache_images=False, single_cls=False, stride=32, pad=0.0, rank=-1):
-        self.img_size = img_size
-        self.augment = augment
-        self.hyp = hyp
+        """
+                初始化过程并没有什么实质性的操作,更多是一个定义参数的过程（self参数）,以便在__getitem()__中进行数据增强操作,所以这部分代码只需要抓住self中的各个变量的含义就算差不多了
+                self.img_files: {list: N} 存放着整个数据集图片的相对路径
+                self.label_files: {list: N} 存放着整个数据集图片的相对路径
+                cache label -> verify_image_label
+                self.labels: 如果数据集所有图片中没有一个多边形label  labels存储的label就都是原始label(都是正常的矩形label)
+                             否则将所有图片正常gt的label存入labels 不正常gt(存在一个多边形)经过segments2boxes转换为正常的矩形label
+                self.shapes: 所有图片的shape
+                self.segments: 如果数据集所有图片中没有一个多边形label  self.segments=None
+                               否则存储数据集中所有存在多边形gt的图片的所有原始label(肯定有多边形label 也可能有矩形正常label 未知数)
+                self.batch: 记载着每张图片属于哪个batch
+                self.n: 数据集中所有图片的数量
+                self.indices: 记载着所有图片的index
+                self.rect=True时self.batch_shapes记载每个batch的shape(同一个batch的图片shape相同)
+                """
+        # 1.赋值一些基础的self变量 用于后面在__getitem__中调用
+        self.img_size = img_size  #经过数据增强后的数据图片大小
+        self.augment = augment    #是否启用数据增强 一般训练时打开 验证时关闭
+        self.hyp = hyp            #超参列表
         self.image_weights = image_weights
-        self.rect = False if image_weights else rect
+        self.rect = False if image_weights else rect   #是否启动矩形训练 一般在训练的时候关闭 验证的时候打开 可以加速
         self.mosaic = self.augment and not self.rect  # load 4 images at a time into a mosaic (only during training)
         self.mosaic_border = [-img_size // 2, -img_size // 2]
         self.stride = stride
@@ -128,6 +163,8 @@ class LoadFaceImagesAndLabels(Dataset):  # for training/testing
         try:
             f = []  # image files
             for p in path if isinstance(path, list) else [path]:
+                # 获取数据集路径path，包含图片路径的txt文件或者包含图片的文件夹路径
+                # 使用pathlib.Path生成与操作系统无关的路径，因为不同操作系统路径的‘/’会有所不同
                 p = Path(p)  # os-agnostic
                 if p.is_dir():  # dir
                     f += glob.glob(str(p / '**' / '*.*'), recursive=True)
@@ -144,9 +181,11 @@ class LoadFaceImagesAndLabels(Dataset):  # for training/testing
             raise Exception('Error loading data from %s: %s\nSee %s' % (path, e, help_url))
 
         # Check cache
-        self.label_files = img2label_paths(self.img_files)  # labels
+        self.label_files = img2label_paths(self.img_files)  # 根据imgs路径找到labels的路径self.label_files
+        # cache label下次运行这个脚本的时候 直接从cache去取出label而不是去文件中取label更快
         cache_path = Path(self.label_files[0]).parent.with_suffix('.cache')  # cached labels
         if cache_path.is_file():
+            # 如果有cache文件，直接加载cache文件
             cache = torch.load(cache_path)  # load
             if cache['hash'] != get_hash(self.label_files + self.img_files) or 'results' not in cache:  # changed
                 cache = self.cache_labels(cache_path)  # re-cache
@@ -154,13 +193,26 @@ class LoadFaceImagesAndLabels(Dataset):  # for training/testing
             cache = self.cache_labels(cache_path)  # cache
 
         # Display cache
+        # 打印cache的结果 nf nm ne nc n = 找到的标签数量，漏掉的标签数量，空的标签数量，损坏的标签数量，总的标签数量
+        # 从cache中读出最新变量赋给self  方便给forward中使用
+        # cache中的键值对最初有: cache[img_file]=[l, shape, segments] cache[hash] cache[results] cache[msg] cache[version]
+
         [nf, nm, ne, nc, n] = cache.pop('results')  # found, missing, empty, corrupted, total
         desc = f"Scanning '{cache_path}' for images and labels... {nf} found, {nm} missing, {ne} empty, {nc} corrupted"
         tqdm(None, desc=desc, total=n, initial=n)
         assert nf > 0 or not augment, f'No labels found in {cache_path}. Can not train without labels. See {help_url}'
 
         # Read cache
+        # 先从cache中去除cache文件中其他无关键值如:'hash', 'version', 'msgs'等都删除
         cache.pop('hash')  # remove hash
+        # pop掉results、hash、version、msgs后只剩下cache[img_file]=[l, shape, segments]
+        # cache.values(): 取cache中所有值 对应所有l, shape, segments
+        # labels: 如果数据集所有图片中没有一个多边形label  labels存储的label就都是原始label(都是正常的矩形label)
+        #         否则将所有图片正常gt的label存入labels 不正常gt(存在一个多边形)经过segments2boxes转换为正常的矩形label
+        # shapes: 所有图片的shape
+        # self.segments: 如果数据集所有图片中没有一个多边形label  self.segments=None
+        #                否则存储数据集中所有存在多边形gt的图片的所有原始label(肯定有多边形label 也可能有矩形正常label 未知数)
+        # zip 是因为cache中所有labels、shapes、segments信息都是按每张img分开存储的, zip是将所有图片对应的信息叠在一起
         labels, shapes = zip(*cache.values())
         self.labels = list(labels)
         self.shapes = np.array(shapes, dtype=np.float64)
@@ -215,6 +267,22 @@ class LoadFaceImagesAndLabels(Dataset):  # for training/testing
 
     def cache_labels(self, path=Path('./labels.cache')):
         # Cache dataset labels, check images and read shapes
+        """用在__init__函数中  cache数据集label
+        加载label信息生成cache文件   Cache dataset labels, check images and read shapes
+        :params path: cache文件保存地址
+        :params prefix: 日志头部信息(彩打高亮部分)
+        :return x: cache中保存的字典
+               包括的信息有: x[im_file] = [l, shape, segments]
+                          一张图片一个label相对应的保存到x, 最终x会保存所有图片的相对路径、gt框的信息、形状shape、所有的多边形gt信息
+                              im_file: 当前这张图片的path相对路径
+                              l: 当前这张图片的所有gt框的label信息(不包含segment多边形标签) [gt_num, cls+xywh(normalized)]
+                              shape: 当前这张图片的形状 shape
+                              segments: 当前这张图片所有gt的label信息(包含segment多边形标签) [gt_num, xy1...]
+                           hash: 当前图片和label文件的hash值  1
+                           results: 找到的label个数nf, 丢失label个数nm, 空label个数ne, 破损label个数nc, 总img/label个数len(self.img_files)
+                           msgs: 所有数据集的msgs信息
+                           version: 当前cache version
+        """
         x = {}  # dict
         nm, nf, ne, nc = 0, 0, 0, 0  # number missing, found, empty, duplicate
         pbar = tqdm(zip(self.img_files, self.label_files), desc='Scanning images', total=len(self.img_files))
@@ -269,6 +337,15 @@ class LoadFaceImagesAndLabels(Dataset):  # for training/testing
     #     return self
 
     def __getitem__(self, index):
+        """
+        这部分是数据增强函数，一般一次性执行batch_size次。
+        训练 数据增强: mosaic(random_perspective) + hsv + 上下左右翻转
+        测试 数据增强: letterbox
+        :return torch.from_numpy(img): 这个index的图片数据(增强后) [3, 640, 640]
+        :return labels_out: 这个index图片的gt label [6, 6] = [gt_num, 0+class+xywh(normalized)]
+        :return self.img_files[index]: 这个index图片的路径地址
+        :return shapes: 这个batch的图片的shapes 测试时(矩形训练)才有  验证时为None   for COCO mAP rescaling
+        """
         index = self.indices[index]  # linear, shuffled, or image_weights
 
         hyp = self.hyp
@@ -286,25 +363,26 @@ class LoadFaceImagesAndLabels(Dataset):  # for training/testing
                 labels = np.concatenate((labels, labels2), 0)
 
         else:
-            # Load image
+            # Load image 进行了等比缩放到长边为设置好的img_size  h0,w0是原始图像的尺寸 h,w是缩放后图像的尺寸
             img, (h0, w0), (h, w) = load_image(self, index)
 
-            # Letterbox
+            # 在Letterbox之前确定这张当前图片的letterbox之后的shape，如果不用self.rect矩形训练shape就是self.img_size。如果
+            #使用self.rect矩形训练shape就是当前的batch的shape，因为矩形训练的话我们整个batch的shape必须统一（在__init__函数的第六节内容）
             shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape
-            img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment)
+            img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment) # 经过letterbox算法，图像变为正方形 【800, 800, 3】,短边贴灰条
             shapes = (h0, w0), ((h / h0, w / w0), pad)  # for COCO mAP rescaling
 
             # Load labels
             labels = []
             x = self.labels[index]
             if x.size > 0:
-                # Normalized xywh to pixel xyxy format
-                labels = x.copy()
-                labels[:, 1] = ratio[0] * w * (x[:, 1] - x[:, 3] / 2) + pad[0]  # pad width
-                labels[:, 2] = ratio[1] * h * (x[:, 2] - x[:, 4] / 2) + pad[1]  # pad height
-                labels[:, 3] = ratio[0] * w * (x[:, 1] + x[:, 3] / 2) + pad[0]
-                labels[:, 4] = ratio[1] * h * (x[:, 2] + x[:, 4] / 2) + pad[1]
-
+                # yolo格式的标签 是class x_center y_center width height x1,y1 x2,y2 x3,y3 x4,y4 x5,y5  整体都已经针对图片的宽和高进行了0-1的归一化操作
+                labels = x.copy() # [num_faces, 15] 15代表的是yolo格式的类别,x_center y_center  w h, 5*2的关键点坐标   这里需要根据padding将归一化的坐标调整到xyxy
+                labels[:, 1] = ratio[0] * w * (x[:, 1] - x[:, 3] / 2) + pad[0]  # pad width 这里乘以w 已经恢复到加了pad的原尺寸了   xmin
+                labels[:, 2] = ratio[1] * h * (x[:, 2] - x[:, 4] / 2) + pad[1]  # pad height 这里乘以h 已经恢复到pad的原尺寸了     ymin
+                labels[:, 3] = ratio[0] * w * (x[:, 1] + x[:, 3] / 2) + pad[0]                                                  #xmax
+                labels[:, 4] = ratio[1] * h * (x[:, 2] + x[:, 4] / 2) + pad[1]                                                  #ymax
+                # 关键点也恢复到padding后的原图尺寸
                 #labels[:, 5] = ratio[0] * w * x[:, 5] + pad[0]  # pad width
                 labels[:, 5] = np.array(x[:, 5] > 0, dtype=np.int32) * (ratio[0] * w * x[:, 5] + pad[0]) + (
                     np.array(x[:, 5] > 0, dtype=np.int32) - 1)
@@ -399,10 +477,36 @@ class LoadFaceImagesAndLabels(Dataset):  # for training/testing
         #print(index, '   --- labels_out: ', labels_out)
         #if nL:
             #print( ' : landmarks : ', torch.max(labels_out[:, 5:15]), '  ---   ', torch.min(labels_out[:, 5:15]))
+        # （3, 800, 800）  (137, 16)  img_path shapes:((683, 1024),((0.78038, 0.78125), (0.0, 133.5))) 原始图像宽高/缩放图像宽高  padding的尺寸
         return torch.from_numpy(img), labels_out, self.img_files[index], shapes
 
     @staticmethod
-    def collate_fn(batch):
+    def collate_fn(batch):      #collate_fn实现改变dataloader的输出格式
+        """这个函数会在create_dataloader中生成dataloader时调用。整理函数 将image和label整合到一起
+        :param batch:  list(ele1, ele2, ele3, ele4)是四个元素的矩阵
+               ele1: 图像数据 比如【3， 448， 832】
+               ele2: 一张图的标签数据 比如【8， 16】 16维是target_index + class + bbox[4] + keypoints[10]
+               ele3: 图像地址
+               ele4: tuple ((原始宽高), (缩放宽高与原始宽高比), (padx pady))
+        :return:
+            1.torch.stack(img, 0):比如[16,3,640,640] 整个batch的图片组成的矩阵
+            2.torch.cat(label, 0):如[30, 16] [num_target, img_index+class_index+xywh(normalized)+keypoints(normalized)] 整个batch的label
+            3.path:整个batch所有图片的路径
+            4.shapes：(h0, w0), ((h / h0, w / w0), pad)    for COCO mAP rescaling
+            pytorch的DataLoader打包一个batch的数据集时要经过此函数进行打包 通过重写此函数实现标签与图片对应的划分，一个batch中哪些标签属于哪一张图片,形如
+            [[0, 6, 0.5, 0.5, 0.26, 0.35...],
+             [0, 6, 0.5, 0.5, 0.26, 0.35...],
+             [1, 6, 0.5, 0.5, 0.26, 0.35...],
+             [2, 6, 0.5, 0.5, 0.26, 0.35...],]
+           前两行标签属于第一张图片, 第三行属于第二张。。。
+        """
+        # 返回的img=[batch_size, 3, 736, 736]
+        #      torch.stack(img, 0): 将batch_size个[3, 736, 736]的矩阵拼成一个[batch_size, 3, 736, 736]
+        # label=[target_sums, 6]  6：表示当前target属于哪一张图+class+x+y+w+h
+        #      torch.cat(label, 0): 将[n1,6]、[n2,6]、[n3,6]...拼接成[n1+n2+n3+..., 6]
+        # 这里之所以拼接的方式不同是因为img拼接的时候它的每个部分的形状是相同的，都是[3, 736, 736]
+        # 而我label的每个部分的形状是不一定相同的，每张图的目标个数是不一定相同的（label肯定也希望用stack,更方便,但是不能那样拼）
+        # 如果每张图的目标个数是相同的，那我们就可能不需要重写collate_fn函数了
         img, label, path, shapes = zip(*batch)  # transposed
         for i, l in enumerate(label):
             l[:, 0] = i  # add target image index for build_targets()
@@ -522,6 +626,7 @@ def load_image(self, index):
         h0, w0 = img.shape[:2]  # orig hw
         r = self.img_size / max(h0, w0)  # resize image to img_size
         if r != 1:  # always resize down, only resize up if training with augmentation
+            # r<1是缩小 这里是要让长边扩到self.img_size的长度 短边则进行相应的等比缩放
             interp = cv2.INTER_AREA if r < 1 and not self.augment else cv2.INTER_LINEAR
             img = cv2.resize(img, (int(w0 * r), int(h0 * r)), interpolation=interp)
         return img, (h0, w0), img.shape[:2]  # img, hw_original, hw_resized

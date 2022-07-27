@@ -78,7 +78,10 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
     # Model
     pretrained = weights.endswith('.pt')
     if pretrained:
+        # 使用预训练模型
+        # torch_distributed_zero_first(RANK):用于同步不同进程对数据读取的上下文管理器
         with torch_distributed_zero_first(rank):
+            # 默认去谷歌云盘下载，一般会下载失败，所以应先从github下载放到weights下面
             attempt_download(weights)  # download if not found locally
         ckpt = torch.load(weights, map_location=device)  # load checkpoint
         if hyp.get('anchors'):
@@ -90,9 +93,12 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
         model.load_state_dict(state_dict, strict=False)  # load
         logger.info('Transferred %g/%g items from %s' % (len(state_dict), len(model.state_dict()), weights))  # report
     else:
+        # 不使用预训练
         model = Model(opt.cfg, ch=3, nc=nc).to(device)  # create
 
     # Freeze
+    # 冻结权重层
+    # 这里只是给了冻结权重层的一个例子, 但是作者并不建议冻结权重层, 训练全部层参数, 可以得到更好的性能, 当然也会更慢
     freeze = []  # parameter names to freeze (full or partial)
     for k, v in model.named_parameters():
         v.requires_grad = True  # train all layers
@@ -101,10 +107,13 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
             v.requires_grad = False
 
     # Optimizer
+    # nbs 标称的batch_size,模拟的batch_size 比如默认的话上面设置的opt.batch_size=16 -> nbs=64
+    # 也就是模型梯度累计 64/16=4(accumulate) 次之后就更新一次模型 等于变相的扩大了batch_size
     nbs = 64  # nominal batch size
     accumulate = max(round(nbs / total_batch_size), 1)  # accumulate loss before optimizing
+    # 根据accumulate设置超参: 权重衰减参数
     hyp['weight_decay'] *= total_batch_size * accumulate / nbs  # scale weight_decay
-
+    # 将模型参数分为三组(weights、biases、bn)来进行分组优化
     pg0, pg1, pg2 = [], [], []  # optimizer parameter groups
     for k, v in model.named_modules():
         if hasattr(v, 'bias') and isinstance(v.bias, nn.Parameter):
@@ -164,6 +173,7 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
         del ckpt, state_dict
 
     # Image sizes
+    # 获取模型的最大stride=32
     gs = int(max(model.stride))  # grid size (max stride)
     imgsz, imgsz_test = [check_img_size(x, gs) for x in opt.img_size]  # verify imgsz are gs-multiples
 
@@ -188,10 +198,11 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
                                             hyp=hyp, augment=True, cache=opt.cache_images, rect=opt.rect, rank=rank,
                                             world_size=opt.world_size, workers=opt.workers,
                                             image_weights=opt.image_weights)
+
+    # 获取标签中最大类别值，与类别数作比较，如果小于类别数则表示有问题
     mlc = np.concatenate(dataset.labels, 0)[:, 0].max()  # max label class
     nb = len(dataloader)  # number of batches
     assert mlc < nc, 'Label class %g exceeds nc=%g in %s. Possible class labels are 0-%g' % (mlc, nc, opt.data, nc - 1)
-
     # Process 0
     if rank in [-1, 0]:
         ema.updates = start_epoch * nb // accumulate  # set EMA updates
@@ -262,14 +273,19 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
             pbar = tqdm(pbar, total=nb)  # progress bar
         optimizer.zero_grad()
         for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
-            ni = i + nb * epoch  # number integrated batches (since train start)
+            ni = i + nb * epoch  # ni: 计算从训练开始的迭代次数 iteration
+            # 关于dataloader的pin_memory和cuda的non_blocking参数
+            # 官方推荐是配合使用这两个参数，pin_memory是默认使用锁页内存，锁页内存和GPU之间直接进行数据同步，而虚拟内存和GPU之间的交互需要通过开辟锁页内存进行交互。
+            # non_blocking=True指的是数据由cpu通过内存向gpu同步的时候，不会阻塞cpu运算。官方推荐在内存足够的时候，配合使用两个参数，可以大幅提高训练速度。
             imgs = imgs.to(device, non_blocking=True).float() / 255.0  # uint8 to float32, 0-255 to 0.0-1.0
 
-            # Warmup
+            # Warmup （前nw次迭代）热身训练迭代的次数iteration范围[1:nw]  选取较小的accumulate，学习率以及momentum,慢慢的训练
             if ni <= nw:
                 xi = [0, nw]  # x interp
                 # model.gr = np.interp(ni, xi, [0.0, 1.0])  # iou loss ratio (obj_loss = 1.0 or iou)
-                accumulate = max(1, np.interp(ni, xi, [1, nbs / total_batch_size]).round())
+                # 这里是线性插值算法，可以实现两个功能：n
+                # 1.针对每个batch,如果batch_size比较大,那么整体梯度累积的数量就会小。比如batch_size=16，可能最多累积四次。batch_size=32，就最多累积2次。
+                # 2.在一个epoch内，梯度累积的数量又是根据线性插值算法去变化的。比如一开始是1次，逐渐变到2,3,4....n 这样相当于每轮开始的时候少累积几次梯度下降，后面则越走累积的越多，类似先小步走，后面慢慢步伐越大。                                                                                                                                                                                                                                  accumulate = max(1, np.interp(ni, xi, [1, nbs / total_batch_size]).round())
                 for j, x in enumerate(optimizer.param_groups):
                     # bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
                     x['lr'] = np.interp(ni, xi, [hyp['warmup_bias_lr'] if j == 2 else 0.0, x['initial_lr'] * lf(epoch)])
@@ -429,14 +445,53 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
 
 
 if __name__ == '__main__':
+    """
+       weights: 权重文件
+       cfg: 模型配置文件 包括nc、depth_multiple、width_multiple、anchors、backbone、head等
+       data: 数据集配置文件 包括path、train、val、test、nc、names、download等
+       hyp: 初始超参文件
+       epochs: 训练轮次
+       batch-size: 训练批次大小
+       img-size: 输入网络的图片分辨率大小
+       resume: 断点续训, 从上次打断的训练结果处接着训练  默认False
+       nosave: 不保存模型  默认False(保存)      True: only test final epoch
+       notest: 是否只测试最后一轮 默认False  True: 只测试最后一轮   False: 每轮训练完都测试mAP
+       workers: dataloader中的最大work数（线程个数）
+       device: 训练的设备
+       single-cls: 数据集是否只有一个类别 默认False
+
+       rect: 训练集是否采用矩形训练  默认False
+       noautoanchor: 不自动调整anchor 默认False(自动调整anchor)
+       evolve: 是否进行超参进化 默认False
+       multi-scale: 是否使用多尺度训练 默认False
+       label-smoothing: 标签平滑增强 默认0.0不增强  要增强一般就设为0.1
+       adam: 是否使用adam优化器 默认False(使用SGD)
+       sync-bn: 是否使用跨卡同步bn操作,再DDP中使用  默认False
+       linear-lr: 是否使用linear lr  线性学习率  默认False 使用cosine lr
+       cache-image: 是否提前缓存图片到内存cache,以加速训练  默认False
+       image-weights: 是否使用图片采用策略(selection img to training by class weights) 默认False 不使用
+
+       bucket: 谷歌云盘bucket 一般用不到
+       project: 训练结果保存的根目录 默认是runs/train
+       name: 训练结果保存的目录 默认是exp  最终: runs/train/exp
+       exist-ok: 如果文件存在就ok不存在就新建或increment name  默认False(默认文件都是不存在的)
+       quad: dataloader取数据时, 是否使用collate_fn4代替collate_fn  默认False
+       save_period: Log model after every "save_period" epoch    默认-1 不需要log model 信息
+       artifact_alias: which version of dataset artifact to be stripped  默认lastest  貌似没用到这个参数？
+       local_rank: rank为进程编号  -1且gpu=1时不进行分布式  -1且多块gpu使用DataParallel模式
+
+       entity: wandb entity 默认None
+       upload_dataset: 是否上传dataset到wandb tabel(将数据集作为交互式 dsviz表 在浏览器中查看、查询、筛选和分析数据集) 默认False
+       bbox_interval: 设置界框图像记录间隔 Set bounding-box image logging interval for W&B 默认-1   opt.epochs // 10
+       """
     parser = argparse.ArgumentParser()
     parser.add_argument('--weights', type=str, default='weights/yolov5s.pt', help='initial weights path')
     parser.add_argument('--cfg', type=str, default='models/yolov5s.yaml', help='model.yaml path')
     parser.add_argument('--data', type=str, default='data/widerface.yaml', help='data.yaml path')
     parser.add_argument('--hyp', type=str, default='data/hyp.scratch.yaml', help='hyperparameters path')
     parser.add_argument('--epochs', type=int, default=250)
-    parser.add_argument('--batch-size', type=int, default=16, help='total batch size for all GPUs')
-    parser.add_argument('--img-size', nargs='+', type=int, default=[800, 800], help='[train, test] image sizes')
+    parser.add_argument('--batch-size', type=int, default=32, help='total batch size for all GPUs')
+    parser.add_argument('--img-size', nargs='+', type=int, default=[800, 800], help='[train, test] image sizes') #注意这里在多卡的情况下是指的总的batch-size
     parser.add_argument('--rect', action='store_true', help='rectangular training')
     parser.add_argument('--resume', nargs='?', const=True, default=False, help='resume most recent training')
     parser.add_argument('--nosave', action='store_true', help='only save final checkpoint')
@@ -462,23 +517,29 @@ if __name__ == '__main__':
 
     # Set DDP variables
     opt.total_batch_size = opt.batch_size
+    # world_size一般指的是分布式训练的主机数量
     opt.world_size = int(os.environ['WORLD_SIZE']) if 'WORLD_SIZE' in os.environ else 1
     opt.global_rank = int(os.environ['RANK']) if 'RANK' in os.environ else -1
     set_logging(opt.global_rank)
     if opt.global_rank in [-1, 0]:
-        check_git_status()
+        #check_git_status()
+        pass
 
     # Resume
     if opt.resume:  # resume an interrupted run
+        # 使用断点续训 就从last.pt中读取相关参数
+        # 如果resume是str，则表示传入的是模型的路径地址
+        # 如果resume是True，则通过get_lastest_run()函数找到runs为文件夹中最近的权重文件last.pt
         ckpt = opt.resume if isinstance(opt.resume, str) else get_latest_run()  # specified or most recent path
         assert os.path.isfile(ckpt), 'ERROR: --resume checkpoint does not exist'
+        # 如果是断点续训，相关的opt参数也要替换成last.pt中的opt参数
         with open(Path(ckpt).parent.parent / 'opt.yaml') as f:
             opt = argparse.Namespace(**yaml.load(f, Loader=yaml.FullLoader))  # replace
         opt.cfg, opt.weights, opt.resume = '', ckpt, True
         logger.info('Resuming training from %s' % ckpt)
     else:
         # opt.hyp = opt.hyp or ('hyp.finetune.yaml' if opt.weights else 'hyp.scratch.yaml')
-        opt.data, opt.cfg, opt.hyp = check_file(opt.data), check_file(opt.cfg), check_file(opt.hyp)  # check files
+        opt.data, opt.cfg, opt.hyp = check_file(opt.data), check_file(opt.cfg), check_file(opt.hyp)  # 查找文件
         assert len(opt.cfg) or len(opt.weights), 'either --cfg or --weights must be specified'
         opt.img_size.extend([opt.img_size[-1]] * (2 - len(opt.img_size)))  # extend to 2 sizes (train, test)
         opt.name = 'evolve' if opt.evolve else opt.name
@@ -487,6 +548,7 @@ if __name__ == '__main__':
     # DDP mode
     device = select_device(opt.device, batch_size=opt.batch_size)
     if opt.local_rank != -1:
+        # LOCAL_RANK != -1 进行多GPU训练
         assert torch.cuda.device_count() > opt.local_rank
         torch.cuda.set_device(opt.local_rank)
         device = torch.device('cuda', opt.local_rank)
@@ -504,6 +566,7 @@ if __name__ == '__main__':
 
     # Train
     logger.info(opt)
+    # 如果不进行超参进化 那么就直接调用train()函数，开始训练
     if not opt.evolve:
         tb_writer = None  # init loggers
         if opt.global_rank in [-1, 0]:

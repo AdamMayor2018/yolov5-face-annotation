@@ -114,7 +114,19 @@ class LandmarksLoss(nn.Module):
 
 
 def compute_loss(p, targets, model):  # predictions, targets, model
+    """
+        train.py里负责loss计算
+    :param p: 预测框 由模型构建中的三个检测头Detector返回的三个yolo层的输出
+           tensor格式 list列表 存放三个tensor 对应的是三个yolo层的输出
+           如: [32, 3, 100, 100, 16]、[32, 3, 50, 50, 16]、[32, 3, 25, 25, 16]
+           [bs, anchor_num, grid_h, grid_w, xywh+class+classes]
+           可以看出来这里的预测值p是三个yolo层每个grid_cell(每个grid_cell有三个预测值)的预测值,后面肯定要进行正样本筛选
+    :param targets: 数据增强后的真实框【num_object, batch_index+class+xywh+keypoints】
+    :param model:
+    :return:
+    """
     device = targets.device
+    # lcls：分类损失 lbox： bbox回归损失 lobj：有无目标损失 lmark：关键点回归损失
     lcls, lbox, lobj, lmark = torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device)
     tcls, tbox, indices, anchors, tlandmarks, lmks_mask = build_targets(p, targets, model)  # targets
     h = model.hyp  # hyperparameters
@@ -194,13 +206,30 @@ def compute_loss(p, targets, model):  # predictions, targets, model
 
 
 def build_targets(p, targets, model):
-    # Build targets for compute_loss(), input targets(image,class,x,y,w,h)
+    """
+        输出gt的信息
+    :param p:      预测框 由模型构建中的三个检测头Detector返回的三个yolo层的输出
+                   tensor格式 list列表 存放三个tensor 对应的是三个yolo层的输出
+                   如: [32, 3, 100, 100, 16]、[32, 3, 50, 50, 16]、[32, 3, 25, 25, 16]
+                   [bs, anchor_num, grid_h, grid_w, class(1)+xywh(4)+keypoints(10)]
+    :param targets:[num_target, img_index+class_index+xywh(normalized)+keypoints(normalized)] 比如[957, 16]
+    :param model:
+    :return:
+    """
     det = model.module.model[-1] if is_parallel(model) else model.model[-1]  # Detect() module
     na, nt = det.na, targets.shape[0]  # number of anchors, targets
     tcls, tbox, indices, anch, landmarks, lmks_mask = [], [], [], [], [], []
-    #gain = torch.ones(7, device=targets.device)  # normalized to gridspace gain
+    #gain = torch.ones(17, device=targets.device)  # normalized to gridspace gain
+    # 17: image_index + class + xywh + keypoints
+    # gain是为了后面将targets=[na,nt,17]中的归一化了的xywh映射到相对feature map尺度上
     gain = torch.ones(17, device=targets.device)
+    # ai 【3, num_targets】 需要在3个anchor上都进行训练 所以将标签赋值na=3个 ai代表3个anchor上在所有target对应的anchor索引。
+    # 用来标记当前这个target属于哪个anchor
+    # [1, 3] => [3, 1] => [3, num_targets] 三行 第一行63个0 第二行62个1 第三行63个2
     ai = torch.arange(na, device=targets.device).float().view(na, 1).repeat(1, nt)  # same as .repeat_interleave(nt)
+    # [63, 6] [3, 63] -> [3, 63, 6] [3, 63, 1] -> [3, 63, 7]  7: [image_index+class+xywh+anchor_index]
+    # 对每一个feature map: 这一步是将target复制三份 对应一个feature map的三个anchor
+    # 先假设所有的target对三个anchor都是正样本(复制三份) 再进行筛选  并将ai加进去标记当前是哪个anchor的target
     targets = torch.cat((targets.repeat(na, 1, 1), ai[:, :, None]), 2)  # append anchor indices
 
     g = 0.5  # bias

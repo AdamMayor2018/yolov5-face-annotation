@@ -6,7 +6,7 @@
         <remote-mappings server-id="python@sftp://ubuntu@10.5.101.152:22/home/ubuntu/anaconda3/envs/face_detection/bin/python">
           <settings>
             <list>
-              <mapping local-root="$PROJECT_DIR$" remote-root="/data/cx/yolov5-face" />
+              <mapping local-root="$PROJECT_DIR$" remote-root="/data/cx/yolov5-face-annotation" />
             </list>
           </settings>
         </remote-mappings>
