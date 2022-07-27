@@ -225,33 +225,41 @@ def build_targets(p, targets, model):
     gain = torch.ones(17, device=targets.device)
     # ai 【3, num_targets】 需要在3个anchor上都进行训练 所以将标签赋值na=3个 ai代表3个anchor上在所有target对应的anchor索引。
     # 用来标记当前这个target属于哪个anchor
-    # [1, 3] => [3, 1] => [3, num_targets] 三行 第一行63个0 第二行62个1 第三行63个2
+    # [1, 3] => [3, 1] => [3, num_targets] 三行 第一行num_target个0 第二行num_target个1 第三行num_target个2
     ai = torch.arange(na, device=targets.device).float().view(na, 1).repeat(1, nt)  # same as .repeat_interleave(nt)
-    # [63, 6] [3, 63] -> [3, 63, 6] [3, 63, 1] -> [3, 63, 7]  7: [image_index+class+xywh+anchor_index]
+    # [num_targets, 6] [3, num_targets] -> [3, num_targets, 6] [3, num_targets, 1] -> [3, num_targets, 7]  7: [image_index+class+xywh+anchor_index]
     # 对每一个feature map: 这一步是将target复制三份 对应一个feature map的三个anchor
     # 先假设所有的target对三个anchor都是正样本(复制三份) 再进行筛选  并将ai加进去标记当前是哪个anchor的target
+    # 通俗理解，现在就是每个yolo输出的feature map，都会放置target的坐标等信息。但因为有三个anchor，所以要把target放三层。
     targets = torch.cat((targets.repeat(na, 1, 1), ai[:, :, None]), 2)  # append anchor indices
-
-    g = 0.5  # bias
+    # 这两个变量是用来扩展正样本的 因为预测框预测到target有可能不止当前的格子预测到了
+    # 可能周围的格子也预测到了高质量的样本 我们也要把这部分的预测信息加入正样本中
+    g = 0.5  # bias  中心偏移  用来衡量target中心点离哪个格子更近
+    # 以自身 + 周围左上右下4个网格 = 5个网格  用来计算offsets
     off = torch.tensor([[0, 0],
                         [1, 0], [0, 1], [-1, 0], [0, -1],  # j,k,l,m
                         # [1, 1], [1, -1], [-1, 1], [-1, -1],  # jk,jm,lk,lm
                         ], device=targets.device).float() * g  # offsets
-
-    for i in range(det.nl):
+    # 遍历三个feature 筛选每个feature map(包含batch张图片)的每个anchor的正样本
+    for i in range(det.nl): # self.nl: number of detection layers   Detect的个数 = 3
+        # anchors: 当前feature map对应的三个anchor尺寸(相对feature map)  [3, 2]
         anchors = det.anchors[i]
         gain[2:6] = torch.tensor(p[i].shape)[[3, 2, 3, 2]]  # xyxy gain
         #landmarks 10
         gain[6:16] = torch.tensor(p[i].shape)[[3, 2, 3, 2, 3, 2, 3, 2, 3, 2]]  # xyxy gain
 
-        # Match targets to anchors
+        # 这里是将bbox和keypoint的坐标 都放缩到featuremap的尺度上 t:[3, num_targets, 17]
         t = targets * gain
         if nt:
-            # Matches
-            r = t[:, :, 4:6] / anchors[:, None]  # wh ratio
+            # Matches t:[3, num_targets, 2] / [3, 1, 2] => r:[3, num_targets, 2]
+            r = t[:, :, 4:6] / anchors[:, None]  # wh相对于anchor的缩放 （w/w h/h）  r:[3, num_targets, 2]
+            # 筛选条件  GT与anchor的宽比或高比超过一定的阈值 就当作负样本
+            # torch.max(r, 1. / r)=[3, 63, 2] 筛选出宽比w1/w2 w2/w1 高比h1/h2 h2/h1中最大的那个
+            # .max(2)返回宽比 高比两者中较大的一个值和它的索引  [0]返回较大的一个值
+            # j: [3, num_targets]  False: 当前gt是当前anchor的负样本  True: 当前gt是当前anchor的正样本
             j = torch.max(r, 1. / r).max(2)[0] < model.hyp['anchor_t']  # compare
-            # j = wh_iou(anchors, t[:, 4:6]) > model.hyp['iou_t']  # iou(3,n)=wh_iou(anchors(3,2), gwh(n,2))
-            t = t[j]  # filter
+            # 根据筛选条件j，过滤掉负样本。得到的是当前featuremap上三个anchor对应的全部正样本t（对应batch-size张图片）
+            t = t[j]  # t:[num_targets, 17]  j:[3, num_targets] => [num_positive_targets, 17]  17里面是包含anchor_index的
 
             # Offsets
             gxy = t[:, 2:4]  # grid xy
