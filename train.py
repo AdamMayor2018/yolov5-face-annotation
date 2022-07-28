@@ -282,7 +282,7 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
             if ni <= nw:
                 xi = [0, nw]  # x interp
                 # model.gr = np.interp(ni, xi, [0.0, 1.0])  # iou loss ratio (obj_loss = 1.0 or iou)
-                # 这里是线性插值算法，可以实现两个功能：n
+                # 这里是线性插值算法，可以实现两个功能：
                 # 1.针对每个batch,如果batch_size比较大,那么整体梯度累积的数量就会小。比如batch_size=16，可能最多累积四次。batch_size=32，就最多累积2次。
                 # 2.在一个epoch内，梯度累积的数量又是根据线性插值算法去变化的。比如一开始是1次，逐渐变到2,3,4....n 这样相当于每轮开始的时候少累积几次梯度下降，后面则越走累积的越多，类似先小步走，后面慢慢步伐越大。                                                                                                                                                                                                                                  accumulate = max(1, np.interp(ni, xi, [1, nbs / total_batch_size]).round())
                 for j, x in enumerate(optimizer.param_groups):
