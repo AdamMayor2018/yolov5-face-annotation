@@ -227,7 +227,7 @@ def build_targets(p, targets, model):
     # 用来标记当前这个target属于哪个anchor
     # [1, 3] => [3, 1] => [3, num_targets] 三行 第一行num_target个0 第二行num_target个1 第三行num_target个2
     ai = torch.arange(na, device=targets.device).float().view(na, 1).repeat(1, nt)  # same as .repeat_interleave(nt)
-    # [num_targets, 6] [3, num_targets] -> [3, num_targets, 6] [3, num_targets, 1] -> [3, num_targets, 7]  7: [image_index+class+xywh+anchor_index]
+    # [num_targets, 16] [3, num_targets] -> [3, num_targets, 16] [3, num_targets, 1] -> [3, num_targets, 17]  17: [image_index+class+xywh+keypoints+anchor_index]
     # 对每一个feature map: 这一步是将target复制三份 对应一个feature map的三个anchor
     # 先假设所有的target对三个anchor都是正样本(复制三份) 再进行筛选  并将ai加进去标记当前是哪个anchor的target
     # 通俗理解，现在就是每个yolo输出的feature map，都会放置target的坐标等信息。但因为有三个anchor，所以要把target放三层。
@@ -238,19 +238,20 @@ def build_targets(p, targets, model):
     # 以自身 + 周围左上右下4个网格 = 5个网格  用来计算offsets
     off = torch.tensor([[0, 0],
                         [1, 0], [0, 1], [-1, 0], [0, -1],  # j,k,l,m
-                        # [1, 1], [1, -1], [-1, 1], [-1, -1],  # jk,jm,lk,lm
+                        # [1, 1], [1, -1], [-1, 1], [-1, -1],  # jk,jm,lk,lmgain
                         ], device=targets.device).float() * g  # offsets
     # 遍历三个feature 筛选每个feature map(包含batch张图片)的每个anchor的正样本
     for i in range(det.nl): # self.nl: number of detection layers   Detect的个数 = 3
         # anchors: 当前feature map对应的三个anchor尺寸(相对feature map)  [3, 2]
-        anchors = det.anchors[i]
-        gain[2:6] = torch.tensor(p[i].shape)[[3, 2, 3, 2]]  # xyxy gain
-        #landmarks 10
-        gain[6:16] = torch.tensor(p[i].shape)[[3, 2, 3, 2, 3, 2, 3, 2, 3, 2]]  # xyxy gain
+        anchors = det.anchors[i] # [3, 2] 每一层对应放置三个anchor
+        gain[2:6] = torch.tensor(p[i].shape)[[3, 2, 3, 2]]  # xywh gain
+        #p:[32, 3, 100, 100, 16]、[32, 3, 50, 50, 16]、[32, 3, 25, 25, 16]  gain是[100, 100, 100, 100, 100, 100, 100, 100, 100, 100] 之类的，为了把xy坐标放大到featuremap层面
+        gain[6:16] = torch.tensor(p[i].shape)[[3, 2, 3, 2, 3, 2, 3, 2, 3, 2]]  # 关键点 xyxy gain
 
         # 这里是将bbox和keypoint的坐标 都放缩到featuremap的尺度上 t:[3, num_targets, 17] 3个维度上的数值是完全一致的
         t = targets * gain #t:[3, num_targets, 17]
         if nt:
+            # t: 3, num_targets, [image_index+class+xywh+keypoints+anchor_index]
             # Matches t:[3, num_targets, 2] / [3, 1, 2] => r:[3, num_targets, 2]
             r = t[:, :, 4:6] / anchors[:, None]  # wh相对于anchor的缩放 （w/w h/h）  r:[3, num_targets, 2]
             # 筛选条件  GT与anchor的宽比或高比超过一定的阈值 就当作负样本
