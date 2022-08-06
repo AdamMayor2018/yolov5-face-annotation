@@ -252,10 +252,10 @@ def build_targets(p, targets, model):
         t = targets * gain #t:[3, num_targets, 17] * [17] = [3, num_targets, 17]
         if nt:
             # t: 3, num_targets, [image_index+class+xywh+keypoints+anchor_index] t已经还原到feature map的尺寸上
-            # Matches t:[3, num_targets, 2] / [3, 1, 2] => r:[3, num_targets, 2]
+            # 正样本筛选 t:[3, num_targets, 2] / [3, 1, 2] => r:[3, num_targets, 2]
             r = t[:, :, 4:6] / anchors[:, None]  # wh相对于anchor的缩放 （w/w h/h）  r:[3, num_targets, 2]  [3, num_targets, 2] / [3, 1, 2] = [3, num_targets, 2]
             # 筛选条件  GT与anchor的宽比或高比超过一定的阈值 就当作负样本
-            # torch.max(r, 1. / r)=[3, 63, 2] 筛选出宽比w1/w2 w2/w1 高比h1/h2 h2/h1中最大的那个
+            # torch.max(r, 1. / r)=[3, num_targets, 2] 筛选出宽比w1/w2 w2/w1 高比h1/h2 h2/h1中最大的那个
             # .max(2)返回宽比 高比两者中较大的一个值和它的索引  [0]返回较大的一个值
             # j: [3, num_targets]  False: 当前gt是当前anchor的负样本  True: 当前gt是当前anchor的正样本   j标记了全部targets在每个featuremap上三个anchor视角下的正负样本的分布
             j = torch.max(r, 1. / r).max(2)[0] < model.hyp['anchor_t']  # hyp[anchor_t] 默认值是4.0， 也就是大到anchor宽高4倍，小到anchor宽高1/4倍的以内的都算正样本
@@ -280,8 +280,9 @@ def build_targets(p, targets, model):
             j = torch.stack((torch.ones_like(j), j, k, l, m))
             # t<=3*num_positive_targets 因为是target中心格点和最近的两个格点 当且仅当target不在边上的时候成立
             t = t.repeat((5, 1, 1))[j]  #j:[5, num_positive_targets] t:[num_positive_targets, 17] => [5, num_positive_targets, 17] => [每个anchor格点及最多两个最近格点 * num_positive_targets, 17] 后面记为num_predict_target
-            # 经过j筛选后t：[7269, 17] 这里相当于把没有出界的target(正样本)的
-            #(torch.zeros_like(gxy)[None] + off[:, None]):[5, num_positive_targets, 2]  / j:[5, num_positive_targets] => offsets:[后面记为num_predict_target, 2]
+            # 经过j筛选后t：[num_predict_target, 17] 真正要进行回归计算的正样本target，每个target可能重复跟左上右下的小格子计算loss
+            #torch.zeros_like(gxy)[None]:[1, num_positive_targets, 2] + off[:, None]:[5, 1, 2] => [5, num_positive_targets, 2]
+            # offsets:[num_predict_targets, 2]  这个对应了num_predict_targets要和那个格子做回归，逐一记录了偏移量
             offsets = (torch.zeros_like(gxy)[None] + off[:, None])[j]    #gxy: [num_positive_targets, 2] off:[5, 2] => [5, num_positive_targets, 2]    offsets:[]
         else:
             t = targets[0]
@@ -291,12 +292,12 @@ def build_targets(p, targets, model):
         b, c = t[:, :2].long().T  # image, class [num_predict_target]
         gxy = t[:, 2:4]  # grid xy [num_predict_target, 2]
         gwh = t[:, 4:6]  # grid wh [num_predict_target, 2]
-        gij = (gxy - offsets).long()  # 预测真实框的网格所在的左上角坐标(有左上右下的网格)
+        gij = (gxy - offsets).long()  # 预测真实框的网格所在的左上角坐标(有左上右下的网格) [num_predict_target, 2]
         gi, gj = gij.T  # grid xy indices
 
         # Append
         a = t[:, 16].long()  # anchor indices
-        # # b: image index  a: anchor index  gj: 网格的左上角y坐标  gi: 网格的左上角x坐标
+        # # b: image index  a: anchor index  gj: 网格的左上角y坐标  gi: 网格的左上角x坐标  这组索引可以找到到底和哪个格子做loss回归计算
         indices.append((b, a, gj.clamp_(0, gain[3] - 1), gi.clamp_(0, gain[2] - 1)))  # image, anchor, grid indices
         # xywh 其中xy为这个target对当前grid_cell左上角的偏移量
         tbox.append(torch.cat((gxy - gij, gwh), 1))  # box
@@ -306,7 +307,7 @@ def build_targets(p, targets, model):
         #landmarks
         lks = t[:,6:16]
         #lks_mask = lks > 0
-        #lks_mask = lks_mask.float()
+        #小于0的置0，大于0置1
         lks_mask = torch.where(lks < 0, torch.full_like(lks, 0.), torch.full_like(lks, 1.0))
 
         #应该是关键点的坐标除以anch的宽高才对，便于模型学习。使用gwh会导致不同关键点的编码不同，没有统一的参考标准
