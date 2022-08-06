@@ -119,9 +119,9 @@ def compute_loss(p, targets, model):  # predictions, targets, model
     :param p: 预测框 由模型构建中的三个检测头Detector返回的三个yolo层的输出
            tensor格式 list列表 存放三个tensor 对应的是三个yolo层的输出
            如: [32, 3, 100, 100, 16]、[32, 3, 50, 50, 16]、[32, 3, 25, 25, 16]
-           [bs, anchor_num, grid_h, grid_w, xywh+class+classes]
-           可以看出来这里的预测值p是三个yolo层每个grid_cell(每个grid_cell有三个预测值)的预测值,后面肯定要进行正样本筛选
-    :param targets: 数据增强后的真实框【num_object, batch_index+class+xywh+keypoints】
+           [bs, anchor_num, grid_h, grid_w, xywh+class+classes+keyponits]
+           可以看出来这里的预测值p是三个yolo层每个grid_cell(每个grid_cell有三个预测值)的预测值,需要筛选出正样本，与之进行loss计算
+    :param targets: 数据增强后的真实框【num_targets, batch_index+class+xywh+keyponits】
     :param model:
     :return:
     """
@@ -221,7 +221,7 @@ def build_targets(p, targets, model):
     tcls, tbox, indices, anch, landmarks, lmks_mask = [], [], [], [], [], []
     #gain = torch.ones(17, device=targets.device)  # normalized to gridspace gain
     # 17: image_index + class + xywh + keypoints
-    # gain是为了后面将targets=[na,nt,17]中的归一化了的xywh映射到相对feature map尺度上
+    # gain是为了后面将target中的归一化了的xywh映射到相对feature map尺度上
     gain = torch.ones(17, device=targets.device)
     # ai 【3, num_targets】 需要在3个anchor上都进行训练 所以将标签赋值na=3个 ai代表3个anchor上在所有target对应的anchor索引。
     # 用来标记当前这个target属于哪个anchor
@@ -232,9 +232,9 @@ def build_targets(p, targets, model):
     # 先假设所有的target对三个anchor都是正样本(复制三份) 再进行筛选  并将ai加进去标记当前是哪个anchor的target
     # 通俗理解，现在就是每个yolo输出的feature map，都会放置target的坐标等信息。但因为有三个anchor，所以要把target放三层。
     targets = torch.cat((targets.repeat(na, 1, 1), ai[:, :, None]), 2)  # append anchor indices
-    # 这两个变量是用来扩展正样本的 因为预测框预测到target有可能不止当前的格子预测到了
-    # 可能周围的格子也预测到了高质量的样本 我们也要把这部分的预测信息加入正样本中
-    g = 0.5  # bias  中心偏移  用来衡量target中心点离哪个格子更近
+    # bias  偏移量 0.5代表0.5个格子
+    # 用来衡量target中心点离哪个格子更近
+    g = 0.5
     # 以自身 + 周围左上右下4个网格 = 5个网格  用来计算offsets
     off = torch.tensor([[0, 0],
                         [1, 0], [0, 1], [-1, 0], [0, -1],  # j,k,l,m
@@ -244,14 +244,14 @@ def build_targets(p, targets, model):
     for i in range(det.nl): # self.nl: number of detection layers   Detect的个数 = 3
         # anchors: 当前feature map对应的三个anchor尺寸(相对feature map)  [3, 2]
         anchors = det.anchors[i] # [3, 2] 每一层对应放置三个anchor
-        gain[2:6] = torch.tensor(p[i].shape)[[3, 2, 3, 2]]  # xywh gain
+        gain[2:6] = torch.tensor(p[i].shape)[[3, 2, 3, 2]]  # xywh 还原到feature map尺寸
         #p:[32, 3, 100, 100, 16]、[32, 3, 50, 50, 16]、[32, 3, 25, 25, 16]  gain是[1, 1, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100] 之类的，为了把xy坐标放大到featuremap层面, class和image_index则不需要扩大
-        gain[6:16] = torch.tensor(p[i].shape)[[3, 2, 3, 2, 3, 2, 3, 2, 3, 2]]  # 关键点 xyxy gain
+        gain[6:16] = torch.tensor(p[i].shape)[[3, 2, 3, 2, 3, 2, 3, 2, 3, 2]]  # 5个关键点的xy 也放到feature map的宽高倍数
 
         # 这里是将bbox和keypoint的坐标 都放缩到featuremap的尺度上 t:[3, num_targets, 17] 3个维度上的数值是完全一致的
-        t = targets * gain #t:[3, num_targets, 17]
+        t = targets * gain #t:[3, num_targets, 17] * [17] = [3, num_targets, 17]
         if nt:
-            # t: 3, num_targets, [image_index+class+xywh+keypoints+anchor_index]
+            # t: 3, num_targets, [image_index+class+xywh+keypoints+anchor_index] t已经还原到feature map的尺寸上
             # Matches t:[3, num_targets, 2] / [3, 1, 2] => r:[3, num_targets, 2]
             r = t[:, :, 4:6] / anchors[:, None]  # wh相对于anchor的缩放 （w/w h/h）  r:[3, num_targets, 2]  [3, num_targets, 2] / [3, 1, 2] = [3, num_targets, 2]
             # 筛选条件  GT与anchor的宽比或高比超过一定的阈值 就当作负样本
