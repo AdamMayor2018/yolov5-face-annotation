@@ -215,6 +215,7 @@ def build_targets(p, targets, model):
     :param targets:[num_target, img_index+class_index+xywh(normalized)+keypoints(normalized)] 比如[957, 16]
     :param model:
     :return:
+            #tcls, tbox, indices, anch, landmarks, lmks_mask
     """
     det = model.module.model[-1] if is_parallel(model) else model.model[-1]  # Detect() module
     na, nt = det.na, targets.shape[0]  # number of anchors, targets
@@ -288,11 +289,11 @@ def build_targets(p, targets, model):
             t = targets[0]
             offsets = 0
 
-        # Define
+
         b, c = t[:, :2].long().T  # image, class [num_predict_target]
         gxy = t[:, 2:4]  # grid xy [num_predict_target, 2]
         gwh = t[:, 4:6]  # grid wh [num_predict_target, 2]
-        gij = (gxy - offsets).long()  # 预测真实框的网格所在的左上角坐标(有左上右下的网格) [num_predict_target, 2]
+        gij = (gxy - offsets).long()  # # .long()都是向下取整，所以这里拿到的都是预测真实框的网格所在的左上角坐标(有左上右下的网格) [num_predict_target, 2]
         gi, gj = gij.T  # grid xy indices
 
         # Append
@@ -311,7 +312,7 @@ def build_targets(p, targets, model):
         lks_mask = torch.where(lks < 0, torch.full_like(lks, 0.), torch.full_like(lks, 1.0))
 
         #应该是关键点的坐标除以anch的宽高才对，便于模型学习。使用gwh会导致不同关键点的编码不同，没有统一的参考标准
-
+        # 关键点相对于左上角的坐标
         lks[:, [0, 1]] = (lks[:, [0, 1]] - gij)
         lks[:, [2, 3]] = (lks[:, [2, 3]] - gij)
         lks[:, [4, 5]] = (lks[:, [4, 5]] - gij)
